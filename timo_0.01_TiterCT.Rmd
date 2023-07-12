@@ -1,0 +1,249 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Setup
+```{r}
+library("tidyr")
+library('ggplot2')
+library('dplyr')
+library("glue")
+
+wkdir = "~/Desktop/GitHub/Obesity/NewExtractions/H9N2/timo_0.01"
+setwd(wkdir)
+savedir = "~/Desktop/GitHub/Obesity/NewExtractions/H9N2/timo_0.01/Output_Figures"
+
+source("~/Desktop/GitHub/Obesity/NewExtractions/H9N2/FD_functions.R")
+```
+
+# Specifying thresholds and plotting variables
+```{r}
+cov_cut = 200
+freq_cut = 0.01
+pvalcut  = 0.05
+
+ntlist = c("A","C","G","T")
+SEGMENTS = c('H9N2_PB2','H9N2_PB1','H9N2_PA','H9N2_HA','H9N2_NP','H9N2_NA','H9N2_MP','H9N2_NS')
+```
+
+```{r}
+diet = c("Obese","Lean","Control")
+dietColors = c("#FF9933","#66CCFF","#606060")
+names(dietColors) = diet
+DietcolScale_fill <- scale_fill_manual(name = "grp",values = dietColors)
+DietcolScale <- scale_colour_manual(name = "grp",values = dietColors)
+```
+
+#Loading metadata
+This includes titer and Ct values when applicable. ND indicates qPCR was run with a negative result; 0 indicates plaque assay or HAI was run with a negative result. NA for any values indicate that data was missing. Sacrificed indicates there was no data at that time point because the ferret had already been sacrificed for pathology. 
+```{r}
+metafile = "~/Desktop/GitHub/Obesity/NewExtractions/H9N2/H9_Metadata.csv"
+
+meta = read.csv(file=metafile,header=T,sep=",",na.strings = c(''))
+meta = filter(meta, resequenced == "yes")
+
+meta$Ct_Mgene = as.numeric(meta$Ct_Mgene)
+# These NAs correspond to samples where there is no data, not samples with negative M gene results
+# only non-resequenced samples have NA Ct values where that means that they were negative for the M gene
+meta = filter(meta, !(is.na(Ct_Mgene)))
+
+meta$titer = as.numeric(meta$titer)
+meta$log10_titer = as.numeric(meta$log10_titer)
+
+meta$inf_route = factor(meta$inf_route, levels = c("Index","Contact","Aerosol","Control"))
+```
+
+# Ct & Titer values for individual ferrets
+```{r}
+meta$inf_route = factor(meta$inf_route, levels = c("Index","Contact","Aerosol","Control"))
+
+CT_plot = ggplot(filter(meta, inf_route == "Index" | inf_route == "Contact"), 
+       aes(x = DPI, y = Ct_Mgene, color = as.character(ferretID))) +
+  geom_point(size = 3) +
+  geom_line(aes(group = ferretID), size = 1.5) +
+  geom_hline(yintercept = 30, linetype = "dotted") +
+  facet_grid(diet~inf_route) +
+  PlotTheme1
+print(CT_plot)
+ggsave("CT_plot.png",CT_plot, path = savedir, width = 15, height = 7)
+
+Titers_plot = ggplot(filter(meta, inf_route == "Index" | inf_route == "Contact"), 
+       aes(x = DPI, y = log10_titer, color = as.character(ferretID))) +
+  geom_point(size = 3) +
+  geom_line(aes(group = ferretID), size = 1.5) +
+  ylim(0,7) +
+  facet_grid(diet~inf_route) +
+  PlotTheme1
+print(Titers_plot)
+ggsave("Titers_plot.png",Titers_plot, path = savedir, width = 15, height = 7)
+```
+
+# Loading coverage file & segment size information
+```{r}
+cov = read.csv("./avg_coverage/H9N2.coverage.csv", header = TRUE, sep = ",")
+
+seg_sizes = "~/Desktop/GitHub/Obesity/NewExtractions/H9N2/SegmentSize.csv"
+sizes = read.csv(file=seg_sizes,header=T,sep=",",na.strings = c(''))
+GenomeSize = (sizes %>% filter(segment == 'H9N2_GENOME'))$SegmentSize
+
+cov$segment = factor(cov$segment, levels = SEGMENTS)
+```
+
+# Checking if data passes thresholds & make coverage plots
+```{r}
+cov_check = CoverageAcross(cov,cov_cut,40,sizes, wkdir)
+```
+
+```{r}
+cov_qual = select(cov_check, name, quality)
+cov_avgtiter = merge(cov, cov_qual, by = c("name"))
+
+cov_avgtiter$totalcount[is.na(cov_avgtiter$totalcount)] = 0
+cov_avgt = group_by(cov_avgtiter,segment,ntpos,quality) %>%
+  mutate(avg_cov = mean(totalcount)) %>%
+  mutate(log10_avg = log10(avg_cov))
+
+avg_titer_plot = ggplot(filter(cov_avgt, quality == "good"), aes(x = ntpos, y = log10_avg)) +
+  geom_line() +
+  geom_hline(yintercept = log10(200), linetype = "dashed", color = "red") +
+  facet_grid(~segment) +
+  ylim(0,4.5) +
+  PlotTheme1
+print(avg_titer_plot)
+ggsave("avg_titer_plot.pdf",avg_titer_plot,path = savedir, width = 20, height = 5)
+```
+
+Merging coverage check info with the rest of the metadata
+```{r}
+meta = merge(meta, cov_check, by.x = c("sample"), by.y = c("name"), all.y = TRUE) %>% unique()
+
+nrow(meta)
+count(meta,quality)
+```
+
+# Making titer plots
+```{r}
+# don't have titer information for W17 cohort (probably were never measured)
+# don't have this info past day 6 for some ferrets sacrificed for pathology at St Jude's
+
+m1 = filter(meta, resequenced == "yes") %>%
+  #filter(quality == "good") %>% # unhashing this will plot only samples with coverage across all samples (only samples with high quality virus) 
+  filter(titer != "NA" & titer != "sacrificed") %>%
+  #filter(DPI == "d02" | DPI == "d04" | DPI == "d06" | DPI == "d08" | DPI == "d10" | DPI == "d12") %>%
+  filter(segment == "H9N2_PB2") %>% # all segments have the same value (it's a per sample measurement), just picked first one
+  group_by(inf_route, diet, DPI) %>%
+  mutate(avg_titer = mean(titer)) %>%
+  mutate(avg_log_titer = mean(log10_titer)) %>%
+  mutate(sd_log_titer = sd(log10_titer)) %>%
+  ungroup()
+
+avg_titer = ggplot(filter(m1,inf_route == "Index" | inf_route == "Contact"), 
+              aes(x = DPI, color = diet)) +
+  geom_point(size = 5, aes(y = avg_log_titer)) +
+  geom_jitter(size = 3, alpha = 0.4, aes(y = log10_titer)) +
+  #geom_errorbar(aes(ymin = avg_log_titer - sd_log_titer, ymax = avg_log_titer + sd_log_titer)) +
+  geom_line(aes(y = avg_log_titer, group = diet), linewidth = 2) +
+  facet_grid(~inf_route) +
+  ylim(0,6) + 
+  ylab("Log10 Titer per sample") +
+  PlotTheme1 +
+  DietcolScale
+print(avg_titer)
+ggsave("avg_titer.pdf", avg_titer, path = savedir, width = 10, height = 5)
+```
+# Test for significance
+```{r}
+o_t = filter(m1,inf_route == "Contact" & diet == "Obese" & DPI == "d10") 
+# All 8 segments have the same info, just picked first segment
+l_t = filter(m1,inf_route == "Contact" & diet == "Lean" & DPI == "d10") 
+# All 8 segments have the same info, just picked first segment
+
+t.test(o_t$titer,l_t$titer)
+# Significant comparisons at p < 0.05 with only good quality samples: Index - d08, Contact - none
+# USE THIS ONE - Significant comparisons at p < 0.05 with good and bad quality samples: Index - none, Contact - none
+```
+
+```{r}
+t_vals = filter(m1,inf_route == "Index" & segment == "H9N2_PB2")
+aov.t_vals = aov(titer ~ diet, t_vals)
+summary(aov.t_vals)
+# neither index nor contact are significantly different with only good quality samples or with good + bad samples
+```
+
+# Ct Values
+```{r}
+ggplot(filter(m1, DPI == "d02" | DPI == "d04" | DPI == "d06" |
+                DPI == "d08" | DPI == "d10" | DPI == "d12"),
+       aes(x = DPI, y = Ct_Mgene)) +
+  geom_point()
+
+ggplot(filter(m1, DPI == "d02" | DPI == "d04" | DPI == "d06" |
+                DPI == "d08" | DPI == "d10" | DPI == "d12"),
+       aes(x = log10_titer, y = Ct_Mgene)) +
+  geom_point() +
+  xlim(0,8) +
+  PlotTheme1
+
+ggplot(filter(m1, log10_titer > 1), aes(x = log10_titer, y = Ct_Mgene)) +
+  geom_point() +
+  xlim(0,8) +
+  PlotTheme1
+
+ggplot(meta, aes(x = quality, y = Ct_Mgene)) +
+  geom_point()
+
+Ct_dist_plot = ggplot(meta, aes(x = Ct_Mgene, fill = quality)) +
+  geom_histogram(binwidth = 1) +
+  geom_vline(xintercept = 32, linetype = "dashed") +
+  PlotTheme1 +
+  ylab("Number of samples")
+print(Ct_dist_plot)
+ggsave("Ct_dist_plot.pdf",Ct_dist_plot,path = savedir, width = 7, height = 5)
+```
+
+```{r}
+m2 = filter(meta, resequenced == "yes") %>%
+  filter(quality == "good") %>% 
+  # if we're only interested in active infections/sequenced virus, then we should only consider samples where all segments have good coverage
+  # but including bad quality shows the trend of fewer samples at later time points better
+  filter(segment == "H9N2_PB2") %>%
+  group_by(inf_route, diet, DPI) %>%
+  mutate(avg_ct = mean(Ct_Mgene)) %>%
+  mutate(sd_ct = sd(Ct_Mgene)) %>%
+  ungroup()
+
+avg_ct_plot = ggplot(filter(m2,inf_route == "Index" | inf_route == "Contact"), 
+              aes(x = DPI, color = diet)) +
+  geom_point(size = 5, aes(y = avg_ct)) +
+  geom_jitter(size = 3, alpha = 0.4, aes(y = Ct_Mgene, shape = quality)) +
+  #geom_errorbar(aes(ymax = avg_ct + sd_ct, ymin = avg_ct - sd_ct)) +
+  geom_line(aes(y = avg_ct, group = diet), linewidth = 2) +
+  facet_grid(~inf_route) +
+  #ylim(0,6) + 
+  ylab("Ct Value") +
+  PlotTheme1 + 
+  scale_y_reverse() +
+  DietcolScale
+print(avg_ct_plot)
+ggsave("avg_ct_plot.pdf", avg_ct_plot, path = savedir, width = 10, height = 5)
+```
+
+# Testing for significance
+```{r}
+o_ct = filter(m2,inf_route == "Contact" & diet == "Obese" & segment == "H9N2_PB2" & DPI == "d02") 
+# Ct value measured for the M gene, but all 8 have the same info from merging earlier
+l_ct = filter(m2,inf_route == "Contact" & diet == "Lean"& segment == "H9N2_PB2" & DPI == "d02") 
+# Ct value measured for the M gene, but all 8 have the same info from merging earlier
+
+t.test(o_ct$Ct_Mgene,l_ct$Ct_Mgene)
+# USE THIS ONE - Significant comparisons at p < 0.05 with only good quality samples: Index - d04 Contact: none
+# Significant comparisons at p < 0.05 with good and bad quality samples: Index - d04 Contact: none
+```
+
+```{r}
+ct_vals = filter(m2,inf_route == "Index" & segment == "H9N2_PB2")
+aov.ct_vals = aov(Ct_Mgene ~ diet, ct_vals)
+summary(aov.ct_vals)
+# neither index nor contact are significantly different with only good quality samples or with good + bad samples
+```

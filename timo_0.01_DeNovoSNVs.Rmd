@@ -1,0 +1,676 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library("tidyr")
+library('ggplot2')
+library('dplyr')
+library("glue")
+library('ggVennDiagram')
+
+wkdir = "~/Desktop/GitHub/Obesity/NewExtractions/H9N2/timo_0.01"
+setwd(wkdir)
+savedir = "~/Desktop/GitHub/Obesity/NewExtractions/H9N2/timo_0.01/Output_Figures"
+
+source("~/Desktop/GitHub/Obesity/NewExtractions/H9N2/FD_functions.R")
+```
+
+```{r}
+diet = c("Obese","Lean","Control")
+dietColors = c("#FF9933","#66CCFF","#606060")
+names(dietColors) = diet
+DietcolScale_fill <- scale_fill_manual(name = "grp",values = dietColors)
+DietcolScale <- scale_colour_manual(name = "grp",values = dietColors)
+```
+
+# Specifying thresholds and plotting variables
+```{r}
+cov_cut = 200
+freq_cut = 0.01
+pvalcut  = 0.05
+
+ntlist = c("A","C","G","T")
+SEGMENTS = c('H9N2_PB2','H9N2_PB1','H9N2_PA','H9N2_HA','H9N2_NP','H9N2_NA','H9N2_MP','H9N2_NS')
+```
+
+#Loading metadata
+This includes titer and Ct values when applicable. ND indicates qPCR was run with a negative result; 0 indicates plaque assay or HAI was run with a negative result. NA for any values indicate that data was missing. Sacrificed indicates there was no data at that time point because the ferret had already been sacrficied for pathology. 
+```{r}
+metafile = metafile = "~/Desktop/GitHub/Obesity/NewExtractions/H9N2/H9_Metadata.csv"
+
+meta = read.csv(file=metafile,header=T,sep=",",na.strings = c(''))
+meta = filter(meta, resequenced == "yes")
+
+meta$Ct_Mgene = as.numeric(meta$Ct_Mgene)
+meta$titer = as.numeric(meta$titer)
+meta$log10_titer = as.numeric(meta$log10_titer)
+
+meta$inf_route = factor(meta$inf_route, levels = c("Index","Contact","Aerosol","Control"))
+```
+
+# Loading in coverage file & segment size information
+```{r}
+cov = read.csv("./avg_coverage/H9N2.coverage.csv", header = TRUE, sep = ",")
+
+seg_sizes = "../SegmentSize.csv"
+sizes = read.csv(file=seg_sizes,header=T,sep=",",na.strings = c(''))
+GenomeSize = (sizes %>% filter(segment == 'H9N2_GENOME'))$SegmentSize
+
+cov$segment = factor(cov$segment, levels = SEGMENTS)
+```
+
+# Checking if data passes thresholds
+```{r}
+cov_check = CoverageAcross(cov,cov_cut,40,sizes, wkdir)
+```
+
+# Merging coverage check info with the rest of the metadata
+```{r}
+meta = merge(meta, cov_check, by.x = c("sample"), by.y = c("name"), all.y = TRUE)
+
+nrow(meta)
+count(meta,quality)
+```
+
+# Loading in variant files
+```{r}
+varfile = "./varfiles/H9N2.VariantsOnly.0.01.200.csv"
+
+# read and rearrange the data
+vars = read.csv(file=varfile,header=T,sep=",",na.strings = c(''))
+vars$name = vars$sample
+```
+
+# Rearranging variant dataframe
+```{r}
+vdf = ArrangeVarWRep(vars)
+# already have replicate data in the varfiles from running CompareReps.v2.py script
+vdf = vdf[!duplicated(vdf), ] %>% droplevels()
+nrow(vdf)
+```
+
+# Filtering variant df with frequency cutoffs
+```{r}
+vdf = filter(vdf, minorfreq1 >= freq_cut & 
+               minorfreq2 >= freq_cut & 
+               minor %in% ntlist &
+               major %in% ntlist) %>% 
+            droplevels()
+# based on MAF study, reps and 0.01% cutoff was best combo
+#filter each replicate separately rather than using the average
+
+vdf = vdf[!duplicated(vdf), ] %>% droplevels()
+nrow(vdf)
+# does not eliminate any variants here
+```
+
+# Filtering variant df by timo binocheck
+```{r}
+#vdf$binocheck = factor(vdf$binocheck, levels = c("False","R1","R2","True"))
+#vdf = filter(vdf, binocheck != "False") %>% unique()
+#nrow(vdf)
+
+# binocheck is highly dependent on the allele frequency threshold used and also relatively conservative
+# as a result, ignore this in favor of found in both replicates across ferrets and cohorts - this is more indicative of a real variant than binocheck
+```
+
+# Adding metadata
+```{r}
+vdf = merge(vdf,meta, by = c("sample","segment"))
+vdf = vdf[!duplicated(vdf), ] %>% droplevels()
+
+vdf$segment = factor(vdf$segment, levels = SEGMENTS)
+
+vdf = filter(vdf, inf_route == "Index" | inf_route == "Contact" | inf_route == "Control")
+# ignoring aerosol for now
+
+vdf = filter(vdf, !(ferretID == 2232 & inf_route == "Index"))
+# since 2232 is both a contact and then an index to another contact, remove the second instance so as not to double count
+# aka only consider 2232 as a contact
+```
+
+```{r}
+vdf = filter(vdf, quality == "good")
+vdf = vdf[!duplicated(vdf), ] %>% droplevels()
+
+good_names = c(levels(factor(vdf$sample)))
+```
+
+```{r}
+transmission_info = "/Users/marissaknoll/Desktop/GitHub/Obesity/NewExtractions/H9N2/TransmissionPairs.csv"
+pairs = read.csv(transmission_info, header = T)
+```
+
+```{r}
+con_change = filter(vdf, stocknt != major) %>%
+  filter(major %in% ntlist)
+con_change = con_change[!duplicated(con_change), ]
+con_change$ntvar = paste0(con_change$ferretID,"_",con_change$segment,"_",
+                        con_change$major,"_",con_change$ntpos,"_",con_change$minor)
+consensus = unique(con_change$ntvar)
+length(consensus)
+```
+
+```{r}
+vdf$ntvar = paste0(vdf$ferretID,"_",vdf$segment,"_",vdf$major,"_",vdf$ntpos,"_",vdf$minor)
+
+minorvdf = filter(vdf, !(ntvar %in% consensus)) %>% unique()
+nrow(vdf) - nrow(minorvdf)
+```
+
+SNV location plots
+```{r}
+SNVLocation = ggplot(minorvdf, aes(x = ntpos, y = ferretID)) +
+  geom_point(aes(color = diet, shape = cohort)) +
+  facet_grid(inf_route~segment) +
+  PlotTheme1 +
+  DietcolScale
+print(SNVLocation)
+ggsave(SNVLocation, file = "SNVLocation.pdf", path = savedir)
+# ferret 1787 doesn't have any variants??
+```
+
+```{r}
+minorvdf$ntvar = paste0(minorvdf$segment,"_",minorvdf$major,minorvdf$ntpos,minorvdf$minor)
+
+# Comparing to SNVs found in the stock
+
+F17_stock = filter(minorvdf, DPI == "Stock", cohort == "F17") 
+F17_stock_ntvar = unique(F17_stock$ntvar)
+W17_stock = filter(minorvdf, DPI == "Stock", cohort == "W17")
+W17_stock_ntvar = unique(W17_stock$ntvar)
+Sm18_stock = filter(minorvdf, DPI == "Stock", cohort == "Sm18")
+Sm18_stock_ntvar = unique(Sm18_stock$ntvar)
+Sp19_stock = filter(minorvdf, DPI == "Stock", cohort == "Sp19")
+Sp19_stock_ntvar = unique(Sp19_stock$ntvar)
+Sp20_stock = filter(minorvdf, DPI == "Stock", cohort == "Sp20")
+Sp20_stock_ntvar = unique(Sp20_stock$ntvar)
+
+F17_ferret = filter(minorvdf , cohort == "F17", inf_route != "Control")
+F17_ferret_ntvar = unique(F17_ferret$ntvar)
+W17_ferret = filter(minorvdf ,cohort == "W17", inf_route != "Control")
+W17_ferret_ntvar = unique(W17_ferret$ntvar)
+Sm18_ferret = filter(minorvdf ,cohort == "Sm18", inf_route != "Control")
+Sm18_ferret_ntvar = unique(Sm18_ferret$ntvar)
+Sp19_ferret = filter(minorvdf ,cohort == "Sp19", inf_route != "Control")
+Sp19_ferret_ntvar = unique(Sp19_ferret$ntvar)
+Sp20_ferret = filter(minorvdf ,cohort == "Sp20", inf_route != "Control")
+Sp20_ferret_ntvar = unique(Sp20_ferret$ntvar)
+```
+
+```{r}
+F17_shared = F17_ferret %>% filter(ntvar %in% F17_stock_ntvar) %>% filter((ntvar %in% F17_ferret_ntvar)) %>% unique()
+F17_denovo = F17_ferret %>% filter((ntvar %in% F17_ferret_ntvar)) %>% filter(!(ntvar %in% F17_stock_ntvar)) %>% unique()
+
+W17_shared = W17_ferret %>% filter(ntvar %in% W17_stock_ntvar) %>% filter((ntvar %in% W17_ferret_ntvar)) %>% unique()
+W17_denovo = W17_ferret %>% filter((ntvar %in% W17_ferret_ntvar)) %>% filter(!(ntvar %in% W17_stock_ntvar)) %>% unique()
+
+Sm18_shared = Sm18_ferret %>% filter(ntvar %in% Sm18_stock_ntvar) %>% filter((ntvar %in% Sm18_ferret_ntvar)) %>% unique()
+Sm18_denovo = Sm18_ferret %>% filter((ntvar %in% Sm18_ferret_ntvar)) %>% filter(!(ntvar %in% Sm18_stock_ntvar)) %>% unique()
+
+Sp19_shared = Sp19_ferret %>% filter(ntvar %in% Sp19_stock_ntvar) %>% filter((ntvar %in% Sp19_ferret_ntvar)) %>% unique()
+Sp19_denovo = Sp19_ferret %>% filter((ntvar %in% Sp19_ferret_ntvar)) %>% filter(!(ntvar %in% Sp19_stock_ntvar)) %>% unique()
+
+Sp20_shared = Sp20_ferret %>% filter(ntvar %in% Sp20_stock_ntvar) %>% filter((ntvar %in% Sp20_ferret_ntvar)) %>% unique()
+Sp20_denovo = Sp20_ferret %>% filter((ntvar %in% Sp20_ferret_ntvar)) %>% filter(!(ntvar %in% Sp20_stock_ntvar)) %>% unique()
+```
+
+```{r}
+stock_shared = rbind(F17_shared, W17_shared, Sm18_shared, Sp19_shared, Sp20_shared) %>% unique()
+stock_shared$aavar = paste0(stock_shared$majoraa,stock_shared$aapos,stock_shared$minoraa)
+
+ferunique = rbind(F17_denovo, W17_denovo, Sm18_denovo, Sp19_denovo, Sp20_denovo) %>% unique
+ferunique$aavar = paste0(ferunique$majoraa,ferunique$aapos,ferunique$minoraa)
+```
+
+SNV Location compared to stock
+```{r}
+StockSharedPlot = ggplot(stock_shared, aes(x = ntpos, y = ferretID)) +
+  geom_point(aes(color = diet, shape = cohort), size = 2) +
+  facet_grid(inf_route~segment, drop = FALSE) +
+  PlotTheme1 +
+  DietcolScale +
+  ggtitle("SNVs found in stock")
+print(StockSharedPlot)
+ggsave(StockSharedPlot, file = "StockSharedPlot.pdf", height = 30, width = 15, path = savedir)
+
+FerUniquePlot = ggplot(ferunique, aes(x = ntpos, y = ferretID)) +
+  geom_point(aes(color = diet)) +
+  facet_grid(inf_route~segment) +
+  PlotTheme1 +
+  DietcolScale +
+  ggtitle("SNVs not found in stock")
+print(FerUniquePlot)
+ggsave(FerUniquePlot, file = "FerUniquePlot.pdf", path = savedir)
+```
+
+Venn diagram of obese and lean de novo SNVs
+```{r}
+o_var = filter(ferunique, diet == "Obese") 
+o_var = unique(o_var$ntvar)
+
+l_var = filter(ferunique, diet == "Lean") 
+l_var = unique(l_var$ntvar)
+
+diet_var <- list(Obese = o_var, Lean = l_var)
+
+DietUniqueSNVS = ggVennDiagram(diet_var)
+print(DietUniqueSNVS)
+ggsave(DietUniqueSNVS, file = "DietUniqueSNVS.pdf", path = savedir)
+```
+
+# Obese- and lean-specific SNVs
+```{r}
+lean = ferunique %>% 
+  filter(ntvar %in% l_var) %>% 
+  filter(!(ntvar %in% o_var)) %>% 
+  unique()
+
+lean$ferretID_var = paste0(lean$ferretID,"_",lean$ntvar)
+
+repeats_lean = lean %>% 
+  group_by(ntvar,ferretID) %>% 
+  tally() %>%
+  group_by(ntvar) %>% # This is to prevent double counting variants within a same ferret but different dpi
+  tally() %>% unique()
+
+
+lean = merge(lean, repeats_lean, by = c("ntvar")) %>% unique()
+
+obese = ferunique %>% 
+  filter(ntvar %in% o_var) %>% 
+  filter(!(ntvar %in% l_var)) %>%
+  unique()
+
+obese$ferretID_var = paste0(obese$ferretID,"_",obese$ntvar)
+
+repeats_obese = obese %>% 
+  group_by(ntvar,ferretID) %>% 
+  tally() %>%
+  group_by(ntvar) %>% # This is to prevent double counting variants within a same ferret but different dpi
+  tally() %>%
+  unique()
+
+obese = merge(obese, repeats_obese, by = c("ntvar")) %>% unique()
+
+dietunique = rbind(lean,obese) %>% unique()
+dietunique$ferret_num = dietunique$n
+dietunique = select(dietunique, !(n))
+```
+
+```{r}
+# FIGURE THIS OUT
+#had to look up these positions manually
+MP_G459A = filter(dietunique, ntvar == "H9N2_MP_G459A") %>% unique()
+MP_G459A$nonsyn = "syn"
+MP_G459A$aavar = "Q153Q"
+MP_T444C = filter(dietunique, ntvar == "H9N2_MP_T444C") %>% unique()
+MP_T444C$nonsyn = "syn"
+MP_T444C$aavar = "C148C"
+MP_G339A = filter(dietunique, ntvar == "H9N2_MP_G339A") %>% unique()
+MP_G339A$nonsyn = "syn"
+MP_G339A$aavar = "K113K"
+
+MPs = c("H9N2_MP_G459A","H9N2_MP_T444C","H9N2_MP_G339A")
+rest = filter(dietunique, !(ntvar %in% MPs)) %>% unique()
+dietunique = rbind(rest, MP_G459A,MP_T444C,MP_G339A)
+```
+
+```{r}
+DietUnique = ggplot(filter(dietunique, ferret_num == 2, nonsyn == "nonsyn"), 
+                    aes(x = ntpos,
+                        y = factor(segment, levels = c('H9N2_NS','H9N2_MP','H9N2_NA','H9N2_NP','H9N2_HA','H9N2_PA','H9N2_PB1','H9N2_PB2')))) +
+  geom_point(aes(color = nonsyn, size = 2)) + 
+  geom_text(data = filter(dietunique, ferret_num == 2, nonsyn == "nonsyn"), aes(label = aavar, vjust = 2, hjust = 0.5)) +
+  ggtitle("Number of samples containing each variant - diet specific") +
+  facet_grid(diet~inf_route) +
+  ylab("Segment") +
+  xlab("Nucleotide Position") +
+  PlotTheme1
+print(DietUnique)
+ggsave(DietUnique, filename = "SegmentSNVPlot_DietUnqique.pdf", path = savedir, width = 10, height = 7)
+
+diet_snvs = filter(dietunique, ferret_num == 2) %>% select(ferretID, DPI, cohort, diet, ntvar, minorfreq) %>% unique()
+write.table(diet_snvs, "diet_snvs.csv",sep = ",", row.names = FALSE)
+```
+# AF and emergence of obese-specific variantss
+```{r}
+# What is the AF distribution of obese-specific variants
+ggplot(filter(dietunique, diet == "Obese" & nonsyn == "nonsyn" & ferret_num == 2), aes(x = minorfreq)) +
+  geom_histogram(binwidth = 0.01) +
+  PlotTheme1
+
+ggplot(filter(dietunique, diet == "Obese" & nonsyn == "nonsyn" & ferret_num == 2), aes(x = inf_route, y = minorfreq)) +
+  geom_boxplot() +
+  #facet_grid(~inf_route) +
+  PlotTheme1
+
+# Obese apadtation -> higher AF than non shared?
+o_in = filter(dietunique, diet == "Obese" & nonsyn == "nonsyn" & ferret_num == 2 & inf_route == "Index")
+o_co = filter(dietunique, diet == "Obese" & nonsyn == "nonsyn" & ferret_num == 2 & inf_route == "Contact")
+t.test(o_in$minorfreq, o_co$minorfreq)
+
+# Diet adaptation (lean and obese) -> higher AF than non shared?
+ind = filter(dietunique, nonsyn == "nonsyn" & ferret_num == 2 & inf_route == "Index")
+#t.test(ind$minorfreq,non_share$minorfreq)
+#
+```
+
+```{r}
+# Do they persist
+lean2 = ferunique %>% 
+  filter(ntvar %in% l_var) %>% 
+  filter(!(ntvar %in% o_var)) %>% 
+  unique()
+lean2$ferretID_var = paste0(lean2$ferretID,"_",lean2$ntvar)
+
+repeats_lean2 = lean2 %>% 
+  mutate(count = 1) %>%
+  group_by(ntvar,ferretID) %>% mutate(day_num = sum(count)) %>% ungroup()
+
+lean_fers = select(repeats_lean2, ntvar, ferretID) %>% unique() %>% group_by(ntvar) %>% tally()
+lean_fers$fer_num = lean_fers$n
+lean_fers = select(lean_fers, !(n))
+lean_wrep = merge(repeats_lean2, lean_fers, by = "ntvar") %>% unique()
+
+####
+
+obese2 = ferunique %>% 
+  filter(ntvar %in% o_var) %>% 
+  filter(!(ntvar %in% l_var)) %>%
+  unique()
+obese2$ferretID_var = paste0(obese2$ferretID,"_",obese2$ntvar)
+
+repeats_obese2 = obese2 %>% 
+  mutate(count = 1) %>%
+  group_by(ntvar,ferretID) %>% mutate(day_num = sum(count)) %>% ungroup() 
+ob_fers = select(repeats_obese2, ntvar, ferretID) %>% unique() %>% group_by(ntvar) %>% tally()
+ob_fers$fer_num = ob_fers$n
+ob_fers = select(ob_fers, !(n))
+obese_wrep = merge(repeats_obese2, ob_fers, by = "ntvar") %>% unique()
+
+dietunique_repeats = rbind(obese_wrep,lean_wrep) %>% unique()
+```
+
+```{r}
+persistence = ggplot(filter(dietunique_repeats, nonsyn == "nonsyn" & fer_num == 2), aes(x = DPI, y = minorfreq)) +
+  geom_point(aes(color = ntvar)) +
+  geom_line(aes(group = ntvar)) +
+  facet_grid(~ferretID) +
+  PlotTheme1
+print(persistence)
+ggsave(persistence, filename = "persistence.pdf", path = savedir, width = 25, height = 5)
+```
+
+```{r}
+# Emergence
+timing = filter(dietunique, diet == "Obese" & nonsyn == "nonsyn" & ferret_num == 2) %>%
+  mutate(count = 1) %>% 
+  group_by(inf_route, DPI) %>%
+  mutate(perday = sum(count)) %>%
+  group_by(inf_route) %>% 
+  mutate(pergroup = sum(count)) %>%
+  mutate(day_ratio = perday / pergroup) %>%
+  select(DPI,inf_route, perday,pergroup, day_ratio) %>% unique()
+
+ggplot(timing, aes(x = DPI, y = day_ratio)) +
+  geom_col() +
+  facet_grid(~inf_route) +
+  PlotTheme1
+
+timing_bydiet = filter(dietunique,nonsyn == "nonsyn" & ferret_num == 2) %>%
+  mutate(count = 1) %>% 
+  group_by(diet,inf_route, DPI) %>%
+  mutate(perday = sum(count)) %>%
+  group_by(diet,inf_route) %>% 
+  mutate(pergroup = sum(count)) %>%
+  mutate(day_ratio = perday / pergroup) %>%
+  select(DPI,diet,inf_route, perday,pergroup, day_ratio) %>% unique()
+
+ggplot(timing_bydiet, aes(x = DPI, y = day_ratio)) +
+  geom_col() +
+  facet_grid(diet~inf_route) +
+  PlotTheme1
+```
+
+# Determining if diet-unique shared variants are transmitted
+```{r}
+dietunique = merge(dietunique, pairs, by = c("ferretID"))
+
+shared = filter(dietunique, ferret_num == 2)
+t = unique(shared$ntvar)
+
+transmitted = data.frame()
+
+for(i in t){
+  print(i)
+  df = filter(shared, ntvar == i)
+  df1 = group_by(df,pair_numbers) %>% tally()
+  # here a 2 means that the two ferrets are in the same transmission pair and a 1 indicates different transmission pairs
+  df2 = merge(df, df1, by = c("pair_numbers"))
+  # add this information back into the dataframe
+  df2$transmission = df2$n.y
+  transmitted = rbind(transmitted, df2)
+}
+
+#formatting stuff
+notshared = filter(dietunique, ferret_num == 1)
+notshared$transmission = 0
+
+transmitted$transmission = transmitted$n
+transmitted = transmitted %>% select(!(n))
+
+dietunique = rbind(notshared, transmitted)
+dietunique$transmission = as.character(dietunique$transmission)
+```
+
+```{r}
+# make new version of this figure, separating out transmission v independent ferrets
+DietUnique_Transmission = ggplot(filter(dietunique, ferret_num > 1, nonsyn != "syn"), 
+                             aes(x = ntpos, 
+                                 y = factor(segment, levels = c('H9N2_NS','H9N2_MP','H9N2_NA','H9N2_NP','H9N2_HA','H9N2_PA','H9N2_PB1','H9N2_PB2')))) +
+  geom_point(aes(color = transmission, size = 2, shape = transmission)) + 
+  ggtitle("Number of samples containing each variant - diet specific") +
+  xlab("Nucleotide position") +
+  ylab("Segment") +
+  facet_grid(diet~inf_route) +
+  PlotTheme1
+print(DietUnique_Transmission)
+ggsave(DietUnique_Transmission, file = "DietUnique_Transmission.pdf", width = 7, height = 5, path = savedir)
+```
+
+# Pulling out repeated nonsynonymous mutations
+```{r}
+nonsyns = filter(dietunique, nonsyn == "nonsyn" & ferret_num > 1) %>% ungroup() %>% unique() %>% droplevels() 
+nonsyns_smol = select(nonsyns,ntvar,aavar,diet,inf_route,transmission) %>% droplevels()
+write.csv(nonsyns_smol, "nonsyns.csv")
+
+nonsyns_dietunique = filter(dietunique, nonsyn == "nonsyn" & transmission > 1) %>% 
+  ungroup() %>% 
+  select(diet,ntvar,aavar,transmission) %>%
+  unique() %>%
+  arrange(desc(transmission))
+
+write.table(nonsyns_dietunique, "nonsyns_dietunique.csv", sep = ",", row.names = FALSE)
+```
+
+# SNVs shared between diet groups
+```{r}
+shared = ferunique %>% 
+  filter(ntvar %in% o_var) %>% 
+  filter(ntvar %in% l_var) %>% 
+  unique()
+shared$ferretID_var = paste0(shared$ferretID,"_",shared$ntvar)
+
+repeats_shared = shared %>% 
+  group_by(ntvar,ferretID) %>% 
+  tally() %>%
+  group_by(ntvar) %>%
+  tally()
+# this is to make sure I'm not repeatedly counting a variant found in one ferret but multiple days 
+
+shared = merge(shared, repeats_shared, by = c("ntvar")) %>% unique()
+
+SharedPlot = ggplot(shared, 
+                    aes(x = ntpos,
+                        y = factor(segment, levels = c('H9N2_NS','H9N2_MP','H9N2_NA','H9N2_NP','H9N2_HA','H9N2_PA','H9N2_PB1','H9N2_PB2')))) +
+  geom_point(aes(size = n, color = nonsyn)) +
+  geom_text(data = filter(shared, n > 4, nonsyn == "nonsyn"), aes(label = aavar, vjust = 2, hjust = 0.5)) +
+  ggtitle("Number of samples containing each variant - Shared between diet groups") +
+  ylab("Segment") +
+  xlab("Nucleotide Position") +
+  PlotTheme1
+print(SharedPlot)
+ggsave(SharedPlot, filename = "SegmentSNVPlot_DietShared.pdf", path = savedir, height = 10, width = 9)
+```
+
+# Extracting common nonsynonymous variants shared between diet groups
+```{r}
+nonsyns_shared = filter(shared, nonsyn == "nonsyn" & n > 1) %>% 
+  ungroup() %>% 
+  select(ntvar,aavar,minorfreq,n) %>%
+  unique() %>%
+  arrange(desc(n))
+
+write.table(nonsyns_shared, "nonsyns_shared.csv", sep = ",", row.names = FALSE)
+```
+
+# Are there differences in allele freq within the shared variants?
+```{r}
+ggplot(nonsyns_shared, aes(x = minorfreq)) +
+  geom_density(aes(group = factor(n, levels = c("2","3","4","5","6","7","8","9","10","22")), 
+                     fill = factor(n, levels = c("2","3","4","5","6","7","8","9","10","22")),
+                   alpha = 0.2))
+
+select(nonsyns_shared, !minorfreq) %>% unique() %>% ggplot(., aes(x = n)) + geom_histogram(binwidth = 1)
+# determining cutoffs for high and low shared
+
+low_shared = filter(nonsyns_shared, n < 5) %>% unique() %>% mutate(cat = "low")
+high_shared = filter(nonsyns_shared, n > 5) %>% unique() %>% mutate(cat = "high")
+all_shared = rbind(low_shared, high_shared)
+
+ggplot(low_shared, aes(x = minorfreq)) +
+  geom_histogram(binwidth = 0.01)
+
+ggplot(high_shared, aes(x = minorfreq)) +
+  geom_histogram(binwidth = 0.01)
+
+ggplot(all_shared, aes(x = minorfreq)) +
+  geom_density(aes(group = cat, fill = cat), alpha = 0.4)
+
+t.test(low_shared$minorfreq, high_shared$minorfreq)
+```
+# Are there differences in AF between shared and non shared variants?
+```{r}
+oneferret = select(ferunique,ntvar, minorfreq, sample) %>% unique() %>% count(ntvar) %>% filter(n == 1) 
+oneferret = unique(oneferret$ntvar)
+singles = filter(ferunique, ntvar %in% oneferret) %>% unique()
+
+non_share = select(singles, ntvar, aavar, minorfreq) %>% mutate(n = 1)
+non_share$cat = "not shared"
+
+ggplot(non_share, aes(x = minorfreq)) +
+  geom_histogram(binwidth = 0.01)
+all_shared$cat = "shared"
+
+try_all = rbind(all_shared, non_share) %>% unique()
+
+ggplot(try_all, aes(x = minorfreq)) +
+  geom_density(aes(group = cat, fill = cat), alpha = 0.4)
+
+t.test(non_share$minorfreq, low_shared$minorfreq)
+t.test(non_share$minorfreq, high_shared$minorfreq)
+```
+
+# Combining all shared(btw obese and lean) compared to not shared
+```{r}
+share_v_noshare_AF = ggplot(try_all, aes(y = minorfreq, x = cat, color = cat)) +
+  geom_boxplot(outlier.shape = NA) + 
+  #geom_jitter(alpha = 0.3) +
+  ylim(0,0.1) +
+  PlotTheme1
+print(share_v_noshare_AF)
+ggsave(share_v_noshare_AF, filename = "share_v_noshare_AF.pdf", path = savedir, height = 5, width = 9)
+
+ggplot(try_all, aes(y = minorfreq, x = cat, color = cat)) +
+  geom_violin() +
+  PlotTheme1
+
+t.test(non_share$minorfreq, all_shared$minorfreq)
+```
+
+# Is there a difference in how often these variants are found in obese v lean ferrets?
+```{r}
+shared_vars = group_by(shared, ntvar, diet) %>% tally() 
+
+ggplot(shared_vars, aes(x = ntvar, y = n, fill = diet)) +
+geom_col(position = "dodge") + 
+#facet_grid(~inf_route) +
+PlotTheme1 +
+DietcolScale_fill
+
+diff_shared_vars = group_by(shared, ntvar, diet) %>% 
+  tally() %>% 
+  pivot_wider(names_from = diet, values_from = n) %>% 
+  mutate(diff = abs(Obese - Lean)) %>% 
+  filter(diff > 2) %>%
+  pivot_longer(cols = c("Lean", "Obese"), names_to = c("diet"))
+  
+ggplot(diff_shared_vars, aes(x = ntvar, y = value, fill = diet)) +
+geom_col(position = "dodge") +
+#facet_grid(~inf_route) +
+PlotTheme1 +
+DietcolScale_fill
+```
+
+
+Is there a difference in AF of the variants found in obese and lean ferrets?
+```{r}
+ggplot(shared, aes(x = minorfreq, fill = diet)) +
+  geom_histogram(binwidth = 0.01) +
+  PlotTheme1 +
+  facet_grid(inf_route~diet) +
+  DietcolScale_fill
+
+o = filter(ferunique, inf_route == "Index" & diet == "Obese")
+l = filter(ferunique, inf_route == "Index" & diet == "Lean")
+t.test(o$minorfreq, l$minorfreq)
+#not significantly different
+```
+
+```{r}
+obese_index = filter(ferunique, diet == "Obese" & inf_route == "Index") %>% ungroup()
+lean_index = filter(ferunique, diet == "Lean" & inf_route == "Index") %>% ungroup()
+t.test(obese_index$minorfreq, lean_index$minorfreq)
+# means are not different
+
+obese_contact = filter(ferunique, diet == "Obese" & inf_route == "Contact") %>% ungroup()
+lean_contact = filter(ferunique, diet == "Lean" & inf_route == "Contact") %>% ungroup()
+t.test(obese_contact$minorfreq, lean_contact$minorfreq)
+# means are not different
+
+# QQ_Plot: compares the quantiles of two distributions, x =y suggests they are drawn from the same distribution
+qqnorm(obese_index$minorfreq, main = "Obese Index - Test of Normal Distribution")
+qqnorm(lean_index$minorfreq, main = "Lean Index - Test of Normal Distribution")
+# neither distribution is normal
+qqplot(obese_index$minorfreq,lean_index$minorfreq, xlab = "Obese Index", ylab = "Lean Index")
+
+qqnorm(obese_contact$minorfreq, main = "Obese Contact - Test of Normal Distribution")
+qqnorm(lean_contact$minorfreq, main = "Lean Contact - Test of Normal Distribution")
+# neither distribution is normal
+qqplot(obese_contact$minorfreq,lean_contact$minorfreq, xlab = "Obese Contact", ylab = "Lean Contact")
+
+# Mann-Whitney-Wilcox test (Mann-Whitney U test): samples are not normally distributed and independent of each other
+wilcox.test(obese_index$minorfreq,lean_index$minorfreq)
+wilcox.test(obese_contact$minorfreq,lean_contact$minorfreq)
+# distributions are not different
+
+# Kolmogorov-Smirnov test: samples are not normally distributed and independent of each other
+# "sensitive to differences in location and shape of the empirical CDFs of the two samples"
+ks.test(obese_index$minorfreq,lean_index$minorfreq)
+ks.test(obese_contact$minorfreq,lean_contact$minorfreq)
+# distributions are not different
+```
+
